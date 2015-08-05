@@ -9,12 +9,14 @@ import pythoncom
 import sys
 import traceback
 import copy
+import re
 
 
 def except_hook(etype, value, tb):
     message = u'异常信息:\n'
     message += ''.join(traceback.format_exception(etype, value, tb))
     wx.LogMessage(message)
+    print message
     wx.MessageBox(u'程序出现异常', caption=u'错误信息', style=wx.ICON_ERROR)
 
 
@@ -24,58 +26,72 @@ class SqlData():
             db_name = 'config.db'
         self.conn = sqlite3.connect(db_name)
         self.conn.text_factory = str
+        self.cur = self.conn.cursor()
 
     def __del__(self):
+        self.cur.close()
         self.conn.close()
 
     def get_config(self):
-        cur = self.conn.cursor()
-        cur.execute('select name, value from config')
-        rows = cur.fetchall()
+        self.cur.execute('select name, value from config')
+        rows = self.cur.fetchall()
         config = {}
         for row in rows:
             config[row[0]] = row[1]
-        cur.close()
         return config
 
     def save_config(self, config):
-        sql = """update config set value = '%s' where name = '%s' """
-        cur = self.conn.cursor()
         try:
             for key, value in config.items():
-                temp = (sql % (value, key)).encode('gbk')
-                cur.execute(temp)
+                temp = ("update config set value = '%s' where name = '%s'" % (value, key)).encode('gbk')
+                self.cur.execute(temp)
             self.conn.commit()
         except sqlite3.Error:
             self.conn.rollback()
             return False
-        finally:
-            cur.close()
         return True
 
     def get_keys(self):
-        cur = self.conn.cursor()
-        cur.execute('select id, key, row, col from keys order by id ')
-        rows = cur.fetchall()
+        self.cur.execute('select id, key from keys order by id')
+        rows = self.cur.fetchall()
         keys = []
         for row in rows:
-            key = {}
-            key['id'] = row[0]
-            key['key'] = row[1]
-            key['row'] = row[2]
-            key['col'] = row[3]
+            key = {
+                'id': row[0],
+                'key': row[1],
+            }
             keys.append(key)
         return keys
+
+    def save_keys(self, config):
+        try:
+            keys = config['keys'].split('|')
+            for i in range(1, len(keys)+1):
+                temp = ("insert or replace into keys(id, key) values(%d, '%s')" % (i, keys[i-1])).encode('gbk')
+                self.cur.execute(temp)
+            self.cur.execute('delete from keys where id > %d' % len(keys))
+            del config['keys']
+            for key, value in config.items():
+                temp = ("update config set value = '%s' where name = '%s'" % (value, key)).encode('gbk')
+                self.cur.execute(temp)
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+            return False
+        return True
 
 
 class Word:
 
-    def __init__(self, visible):
+    def __init__(self, visible, keys, config):
         self.word = win32com.client.Dispatch('Word.Application')
         self.word.Visible = visible
         self.word.ScreenUpdating = visible
         self.word.DisplayAlerts = False
         self.doc = None
+        self.keys = keys
+        self.filter_row = config['filter_row'].decode('gbk').split('|')
+        self.filter_col = config['filter_col'].decode('gbk').split('|')
 
     def __del__(self):
         try:
@@ -85,12 +101,12 @@ class Word:
             pass
 
     def open(self, name):
-        self.doc = self.word.Documents.Open(name)
-        print 'open doc', self.doc
+        self.doc = self.word.Documents.Open(name, ReadOnly=True)
 
     def close(self):
-        self.doc.Close()
-        self.doc = None
+        if self.doc is not None:
+            self.doc.Close()
+            self.doc = None
 
     def doc_pages(self):
         last_range = self.doc.Range(self.doc.Content.End-1, self.doc.Content.End)
@@ -98,25 +114,23 @@ class Word:
 
     def find_next_paragraph(self, range_obj):
         count = 1
-        next_one = None
         while True:
-            next_one = range_obj.Next(Unit=4, Count=count)
-            if len(next_one.Text.replace(' ', '').replace('\r', '')
-                    .replace('\a', '').replace('\t', '').replace('\x0c', '')) > 0:
-                break
+            next_range = range_obj.Next(Unit=4, Count=count)
+            # if len(next_one.Text.replace(' ', '').replace('\r', '').replace('\a', '')
+            #     .replace('\t', '').replace('\x0c', '')) > 0:
+            if next_range.ComputeStatistics(Statistic=6) > 0:
+                return next_range
             count += 1
-        return next_one
 
     def find_previous_paragraph(self, range_obj):
         count = 1
-        previous_range = None
         while True:
             previous_range = range_obj.Previous(Unit=4, Count=count)
-            if len(previous_range.Text.replace(' ', '').replace('\r', '')
-                    .replace('\a', '').replace('\t', '').replace('\x0c', '')) > 0:
-                break
+            # if len(previous_range.Text.replace(' ', '').replace('\r', '')
+            #     .replace('\a', '').replace('\t', '').replace('\x0c', '')) > 0:
+            if previous_range.ComputeStatistics(Statistic=6) > 0:
+                return previous_range
             count += 1
-        return previous_range
 
     def row_yes_parse(self, table):
         result = []
@@ -231,7 +245,7 @@ class Word:
         else:
             return self.row_yes_parse(table)
 
-    def parse_table(self, table):
+    def parse_table(self, table, may_col=0):
         col_ct = table.Columns.Count
         row_ct = table.Rows.Count
         if col_ct == 2:
@@ -240,6 +254,9 @@ class Word:
         elif table.Uniform is True:
             wx.LogMessage(u'WORD表格是个规范表格 行数:%d, 列数:%d，按行继续处理' % (row_ct, col_ct))
             result = self.uniform_parse(table)
+        elif may_col != 0 and may_col == col_ct:
+            wx.LogMessage(u'WORD表格行数:%d, 列数:%d，按列继续处理' % (row_ct, col_ct))
+            result = self.col_yes_parse(table)
         elif row_ct <= 7:
             wx.LogMessage(u'WORD表格行数:%d, 列数:%d，按行继续处理' % (row_ct, col_ct))
             result = self.row_yes_parse(table)
@@ -250,23 +267,22 @@ class Word:
 
     def is_other_table(self, find_table):
         for item in find_table[0]:
-            if u'税' in item or u'分红' in item or u'行业' in item or u'产品' in item or u'损益' in item \
-                    or u'支出' in item or u'接待' in item or u'资产' in item or u'成本' in item \
-                    or u'供应商' in item:
-                return True
+            for key in self.filter_row:
+                if key in item:
+                    return True
         for item in find_table:
-            if u'营业税' in item[0] or u'应收' in item[0] or u'合同' in item[0] or u'逾期' in item[0] \
-                    or u'费用' in item[0] or u'情况' in item[0] or u'投资收益' in item[0] or u'人民币' in item[0]:
-                return True
+            for key in self.filter_col:
+                if key in item[0]:
+                    return True
         return False
 
-    def parse(self, keys):
+    def parse(self):
         result = {}
         find_any_key = 0
         remarks = []
-        for key in keys:
+        for key in self.keys:
             wx.LogMessage(u'查找关键【%s】字' % key['key'].decode('gbk'))
-            cur_pos = self.doc.Content.Start
+            cur_pos = self.doc.Content.Start  # 每次从头开始
             while True:
                 self.doc.Activate()
                 selection = self.word.Selection
@@ -287,8 +303,10 @@ class Word:
                 key_range_s = key_range.Start
                 key_range_e = key_range.End
                 if key_range_e - key_range_s > 80:
-                    wx.LogMessage(u'关键字所在段落太长，排除关键字')
-                    continue
+                    key_range_text = key_range.Text
+                    if u'元' not in key_range_text and u'占' not in key_range_text:
+                        wx.LogMessage(u'关键字所在段落太长，排除关键字')
+                        continue
                 key_range_page = key_range.Information(3)
                 wx.LogMessage(u'在%d页查找到关键字' % key_range_page)
                 if key_range.Information(12) is True:  # wdWithInTable = 12
@@ -300,20 +318,18 @@ class Word:
                     continue
 
                 # 向后读到一个表为止
-                find_text_try = False
-                find_go_next = False
-                tow_table_flag = False
+                find_try_next = True  # 是否还要继续处理
+                find_go_next = False  # 直接开始查找下一个
+                tow_table_flag = False  # 用来标记是否为分页表格，在查找表格后一段的时候需要使用
                 next_table_range = None
                 while True:
                     table_range = key_range.Next(Unit=15)  # 15 => table
-                    if table_range is None:
-                        # 查找到文档尾
-                        table_s = self.doc.Content.End
-                        # cur_pos = find_e-2
-                        find_text_try = True
+                    if table_range is None:   # 查找到文档尾
+                        table_s = self.doc.Content.End  # 设置表头为文件尾部，方便分析文字
                         break
-                    if key['id'] == 5:
-                        # 看看是否要做特殊处理
+                    table_s = table_range.Start  # 不能移到后面去，分析文字的时候需要用
+                    table_e = table_range.End
+                    if key['id'] == 5:  # 对于可能是总表的情况看看是否要做特殊处理
                         text_row_range = self.find_next_paragraph(key_range)
                         text_row_range_text = text_row_range.Text.replace('\r', '').replace(' ', '')
                         row_content = text_row_range_text.split('\t')
@@ -322,16 +338,11 @@ class Word:
                             text_row_range_text = text_row_range.Text.replace('\r', '').replace(' ', '')
                             row_content = text_row_range_text.split('\t')
                             if len(row_content) == 2 and u'占年度' in row_content[0] and u'%' in row_content[1]:
-                                find_text_try = True
                                 break
-                    table_s = table_range.Start
-                    table_e = table_range.End
                     table_t = table_range.Tables(1)
                     if table_s - find_e > 400:
                         wx.LogMessage(u'关键字和表格间大于400字，排除表格')
-                        find_text_try = True
                         break
-                    # cur_pos = table_e
                     table_page = table_range.Information(3)  # 页码
                     table_index = (table_page, table_s)
                     if table_index in result.keys():
@@ -347,30 +358,31 @@ class Word:
                     next_table_page = next_table_range.Information(3)  # 页码
                     if table_page + 1 == next_table_page:
                         next_table_s = next_table_range.Start
-                        # next_table_e = next_table_range.End
                         table_between_ct = self.doc.Range(table_e, next_table_s).ComputeStatistics(Statistic=6)
                         if table_between_ct == 0:
                             tow_table_flag = True
-                            # cur_pos = next_table_e
                             wx.LogMessage(u'表格分页，分别在%d，%d两页' % (table_page, next_table_page))
                             next_table_t = next_table_range.Tables(1)
-                            find_next_table = self.parse_table(next_table_t)
+                            may_col = len(find_table[-1]) if len(find_table) > 0 else 0
+                            find_next_table = self.parse_table(next_table_t, may_col)
                             if len(find_next_table) > 1 and len(find_table) > 0 \
                                     and find_table[0][0] == find_next_table[0][0]:
                                 find_next_table.pop(0)
+                            elif len(find_next_table) > 0 and len(find_next_table[0]) == 3 and len(find_table) > 0 \
+                                    and len(find_next_table[0][1]) == 0 and len(find_next_table[0][2]) == 0:
+                                find_table[-1][0] += find_next_table[0][0]
+                                find_next_table.pop(0)
                             find_table.extend(find_next_table)
                     if len(find_table) == 0:  # 表不合规则
-                        find_text_try = True
                         break
                     if len(find_table) > 10:
                         wx.LogMessage(u'表格行数超过10行，排除')
-                        find_text_try = True
                         break
                     if self.is_other_table(find_table) is True:
                         wx.LogMessage(u'取到其他表格，排除')
-                        find_text_try = True
                         break
 
+                    # 对表格做特殊处理
                     if len(find_table) >= 2 and len(find_table[-1]) == 3 and len(find_table[-2]) == 4:
                         find_table[-1].insert(1, u'-')
                     if len(find_table[-1]) == 1 and find_table[-1][0] == u'（%）':
@@ -383,6 +395,13 @@ class Word:
                             and len(find_table[1]) == 2 and len(find_table[2]) == 3:
                         if u',' in find_table[1][0]:
                             find_table[1].insert(0, u'-')
+
+                    if len(find_table) == 8 and len(find_table[1]) == 3 and len(find_table[1][0]) == 0 \
+                            and u'人民币' in find_table[1][1] and u'%' == find_table[1][2]:
+                        find_table[0][1] = find_table[0][1] + u'(' + find_table[1][1] + u')'
+                        find_table[0][2] = find_table[0][2] + u'(' + find_table[1][2] + u')'
+                        find_table.pop(1)
+
                     if len(find_table) == 1 and u'客户名称' in find_table[0]:
                         wx.LogWarning(u'找到只有标题的空表，排除')
                         find_go_next = True
@@ -392,16 +411,19 @@ class Word:
                         find_go_next = True
                         break
                     else:
-                        find_text_try = False
+                        find_try_next = False  # 找到了表格不用再尝试
                         break
                 # 尝试处理表格完毕
                 if find_go_next is True:
                     continue
                 # 尝试处理文字表格
-                if find_text_try is True:
+                while True:
+                    if find_try_next is not True:
+                        break
                     if table_s - key_range_e < 20:
                         # 表格和关键字间的字太少
-                        continue
+                        find_go_next = True
+                        break
                     # 做一个尝试，有没有可能是个表格
                     after_key_200_e = key_range_e + 200 if table_s - key_range_e > 200 else table_s
                     after_key_200 = self.doc.Range(key_range_e, after_key_200_e).Text\
@@ -421,7 +443,7 @@ class Word:
                     table_col = len(row_content)
                     if table_col < 2:
                         wx.LogMessage(u'关键字后的文本不能正确解析')
-                        continue
+                        break
                     if u'期' == row_content[0] and u'间' == row_content[1]:
                         row_content.pop(0)
                         row_content[0] = u'期间'
@@ -445,18 +467,102 @@ class Word:
                             break
                     table_range = self.doc.Range(table_s, table_e)
                     if len(find_table) < 2:
-                        continue
+                        break
                     # 对 合计 分开的做特殊处理
                     if u'合' in find_table[-2][-1]:
                         find_table[-2][-1] = find_table[-2][-1].replace(u'合', '')
                         find_table[-1][0] = u'合计'
                     if self.is_other_table(find_table) is True:
                         wx.LogMessage(u'取到其他表格，排除')
-                        continue
-                    # cur_pos = table_e
+                        break
                     # 成功走到这里说明解析文字成功了，删除备注
                     if remarks_add_flag is True:
                         remarks.pop(-1)
+                    # 找到了 不要再进行其他解析
+                    find_try_next = False
+
+                if find_go_next is True:
+                    continue
+                while True:
+                    if find_try_next is not True:
+                        break
+                    # 第一个表格是以文字的形式描述的，对此做特殊处理
+                    table_range = self.find_next_paragraph(key_range)
+                    after_key_text = table_range.Text.replace(' ', '').replace('\r', '')\
+                        .replace('\a', '').replace(u'％', u'%')
+                    if u'元' in after_key_text and u'%' not in after_key_text:  # 占比在下面一段的情况
+                        after_table_range = self.find_next_paragraph(table_range)
+                        after_table_range_text = after_table_range.Text.replace(' ', '').replace('\r', '')\
+                            .replace('\a', '').replace(u'％', u'%')
+                        percent_flag_pos = after_table_range_text.find(u'%')
+                        if percent_flag_pos != -1:
+                            after_key_text += after_table_range_text[0:percent_flag_pos+1]
+                    else:
+                        key_range_text = key_range.Text.replace(' ', '').replace('\r', '')\
+                            .replace('\a', '').replace(u'％', u'%')
+                        if u'%' in key_range_text and u'占' in key_range_text:
+                            table_range = key_range
+                            table_page = table_range.Information(3)  # 页码
+                            table_index = (table_page, table_range.Start)
+                            if table_index in result.keys():
+                                find_go_next = True
+                                break
+                            after_key_text = key_range_text  # 关键字本身为描述字段
+                    # if len(after_key_text) > 100:
+                    #    wx.LogMessage(u'关键字后一段文字超过100，排除')
+                    #    break
+                    if u'占' not in after_key_text:
+                        break
+                    if u'客户' not in after_key_text and u'主要产品经销商' not in after_key_text:
+                        break
+                    if u'营业收入' not in after_key_text and u'销售总额' not in after_key_text \
+                            and u'销售收入' not in after_key_text and u'销售额' not in after_key_text \
+                            and u'销售金额' not in after_key_text:
+                        break
+                    money_text_pos = after_key_text.find(u'元', 1)  # 从下标1开始查找,后面直接判断前面那个数字
+                    percent_text_pos = after_key_text.find(u'%', money_text_pos+1)
+                    if money_text_pos == -1 and percent_text_pos == -1:
+                        break
+                    if money_text_pos != -1:
+                        if u'万' == after_key_text[money_text_pos-1]:
+                            money_base = 10000
+                            money_text_pos -= 1
+                        elif u'亿' == after_key_text[money_text_pos-1]:
+                            money_base = 100000000
+                            money_text_pos -= 1
+                        else:
+                            money_base = 1
+                        number_str = list()
+                        for i in range(money_text_pos-1, 0, -1):
+                            if (u'0' <= after_key_text[i] <= u'9') or u'.' == after_key_text[i]:
+                                number_str.insert(0, after_key_text[i])
+                            elif u',' == after_key_text[i]:
+                                continue
+                            else:
+                                break
+                        money_number = float(''.join(number_str)) * money_base
+                        money_number_str = '{:.2f}'.format(money_number)
+                    else:
+                        money_number_str = ''
+                    if percent_text_pos != -1:
+                        percent_str = ['%', ]
+                        for i in range(percent_text_pos-1, percent_text_pos-6, -1):
+                            if (u'0' <= after_key_text[i] <= u'9') or u'.' == after_key_text[i]:
+                                percent_str.insert(0, after_key_text[i])
+                        percent_text = ''.join(percent_str)
+                    else:
+                        percent_text = ''
+                    find_table = [[after_key_text, u'前五名客户合计销售金额', money_number_str],
+                                  [u'纯文字描述', u'前五名客户合计销售金额占年度销售总额比例', percent_text]]
+                    table_page = table_range.Information(3)  # 页码
+                    table_index = (table_page, table_range.Start)
+                    find_try_next = False  # 找到了不要再尝试了
+
+                if find_go_next is True:
+                    continue
+                if find_try_next is True:
+                    wx.LogMessage(u'未能成功解析，继续查找')
+                    continue
 
                 table_col = 0
                 for row in find_table:
@@ -518,16 +624,18 @@ class Excel():
         self.current_begin = 1
         self.current_end = 1
         self.config = SqlData().get_config()
-        self.keys = None
         self.word = None
 
     def init_word(self, visible):
-        self.word = Word(visible)
-        self.keys = SqlData().get_keys()
+        keys = SqlData().get_keys()
+        self.word = Word(visible, keys, self.config)
 
     def open(self):
         self.wkbk = self.excel.Workbooks.Open(self.config['excel_file'])
         self.wksht = self.wkbk.Worksheets(self.config['sheet'])
+
+    def save(self):
+        self.wkbk.Save()
 
     def clear(self):
         begin_row = self.first_row
@@ -576,9 +684,6 @@ class Excel():
         self.save()
         wx.LogMessage(u'成功将找到的文件初始化到Excel中')
 
-    def save(self):
-        self.wkbk.Save()
-
     def next_doc(self):
         self.current_begin = self.current_end + 1
         first = self.wksht.Cells(self.current_begin, 1).Value
@@ -594,8 +699,8 @@ class Excel():
         return True
 
     def is_processed(self):
-        if self.wksht.Cells(self.current_begin, 3).Value is not None\
-                and self.wksht.Cells(self.current_begin, 3).Value == u'是':
+        if self.wksht.Cells(self.current_begin, 4).Value is not None\
+                and self.wksht.Cells(self.current_begin, 4).Value == u'是':
             return True
         return False
 
@@ -605,42 +710,53 @@ class Excel():
         if end_row - begin_row + 1 == row_ct:  # 正好
             wx.LogMessage(u'调整表格：行数正好符合')
         elif end_row - begin_row + 1 > row_ct:  # 表格有多
-            self.wksht.Range('A%d:E%d' % (begin_row+row_ct, end_row)).EntireRow.Delete()
+            self.wksht.Range('A%d:F%d' % (begin_row+row_ct, end_row)).EntireRow.Delete()
             self.current_end = begin_row + row_ct - 1
             wx.LogMessage(u'调整表格：行数有多，删除%d行' % (end_row-self.current_end))
         else:  # 还有空余行，但不够用
             self.current_end = begin_row + row_ct - 1
-            self.wksht.Range('A%d:E%d' % (end_row+1, self.current_end)).EntireRow.Insert()
-            self.wksht.Range('A%d:E%d' % (begin_row, begin_row)).Copy()
-            self.wksht.Paste(self.wksht.Range('A%d:E%d' % (end_row+1, self.current_end)))
+            self.wksht.Range('A%d:F%d' % (end_row+1, self.current_end)).EntireRow.Insert()
+            self.wksht.Range('A%d:F%d' % (begin_row, begin_row)).Copy()
+            self.wksht.Paste(self.wksht.Range('A%d:F%d' % (end_row+1, self.current_end)))
             wx.LogMessage(u'调整表格：行数不够，添加%d行' % (self.current_end-end_row))
 
     def process_doc(self):
-        doc_name = self.wksht.Cells(self.current_begin, 2).Hyperlinks(1).TextToDisplay + '.doc'
+        doc_name = self.wksht.Cells(self.current_begin, 3).Hyperlinks(1).TextToDisplay
         doc_id = self.wksht.Cells(self.current_begin, 1).Value
         wx.LogMessage(u'====== 开始处理%s，编号：%d ======' % (doc_name, doc_id))
         self.word.open(os.path.join(self.config['word_dir'].decode('gbk'), doc_name))
-        try:
-            result, find_any_key, remarks = self.word.parse(self.keys)
-            wx.LogMessage(u'关键字查找完毕')
-            doc_pages = self.word.doc_pages()
-            if find_any_key > 0:
-                self.write_data(result, doc_pages)
-            else:
-                self.wksht.Range('C%d:C%d' % (self.current_begin, self.current_end)).Value = u'是'
-            for remark in remarks:
-                self.write_remark(remark)
-            self.write_remark(u'总共找到%d次关键字' % find_any_key)
-            wx.LogMessage(u'处理%s完毕' % doc_name)
-            self.wkbk.Save()
-        finally:
-            self.word.close()
+        result, find_any_key, remarks = self.word.parse()
+        wx.LogMessage(u'关键字查找完毕')
+        doc_pages = self.word.doc_pages()
+        self.write_data(result, doc_pages)
+        if len(result) == 0:
+            self.wksht.Range('D%d:D%d' % (self.current_begin, self.current_end)).Value = u'否'
+            self.wksht.Cells(self.current_begin, 22).Value = u'需手工整理'
+        for remark in remarks:
+            self.write_remark(remark)
+        self.write_find_time(find_any_key)
+        wx.LogMessage(u'处理%s完毕' % doc_name)
+        self.wkbk.Save()
+        self.word.close()
 
-    def write_remark(self, remark, col=20):
+    def write_remark(self, remark, col=22):
         write_row = self.current_begin-1
         for row in range(self.current_begin, self.current_end+1):
             cell_value = self.wksht.Cells(row, col).Value
             if cell_value is None:
+                write_row = row
+                break
+        if write_row == self.current_begin-1:
+            self.write_remark(remark, col+1)
+        else:
+            self.wksht.Cells(write_row, col).Value = remark
+
+    def write_find_time(self, find_time, col=23):
+        remark = u'总共找到%d次关键字' % find_time
+        write_row = self.current_begin-1
+        for row in range(self.current_begin, self.current_end+1):
+            cell_value = self.wksht.Cells(row, col).Value
+            if cell_value is None or (isinstance(cell_value, str) and u'次关键字' in cell_value):
                 write_row = row
                 break
         if write_row == self.current_begin-1:
@@ -661,7 +777,11 @@ class Excel():
         first_table = tables[sorted_key[0]]
         if first_table['table']['row'] == 2 and u'前' in first_table['table']['after1'] \
                 and u'√不适用' in first_table['table']['after2']:
-            self.wksht.Cells(self.current_begin, 20).Value = u'第一个明细表不适用'
+            first_table_col = first_table['table']['col']
+            if first_table_col < 5:
+                self.wksht.Cells(self.current_begin, 22).Value = u'第一个明细表不适用'
+            else:
+                self.wksht.Cells(self.current_begin, 17+first_table_col).Value = u'第一个明细表不适用'
         self.adjust_row(row_ct)
         count = 1
         end_row = self.current_begin - 1
@@ -671,18 +791,21 @@ class Excel():
             table_col = table['table']['col']
             begin_row = end_row + 1
             end_row = end_row + table_row
-            self.wksht.Range('F%d:F%d' % (begin_row, end_row)).Value = table['key']['id']
-            self.wksht.Range('G%d:G%d' % (begin_row, end_row)).Value = table['key']['key']
-            self.wksht.Range('I%d:I%d' % (begin_row, end_row)).Value = table['table']['row']
-            self.wksht.Range('J%d:J%d' % (begin_row, end_row)).Value = table['table']['before2']
-            self.wksht.Range('K%d:K%d' % (begin_row, end_row)).Value = table['table']['before1']
-            self.wksht.Range('L%d:L%d' % (begin_row, end_row)).Value = table['table']['after1']
-            self.wksht.Range('M%d:M%d' % (begin_row, end_row)).Value = table['table']['after2']
-            self.wksht.Range('N%d:N%d' % (begin_row, end_row)).Value = u'表%d' % count
-            self.wksht.Range('O%d:O%d' % (begin_row, end_row)).Value = table['table']['page']
-            begin_col = 16
-            if table_col < 4:
-                begin_col = 20 - table_col
+            self.wksht.Range('G%d:G%d' % (begin_row, end_row)).Value = table['key']['id']
+            self.wksht.Range('H%d:H%d' % (begin_row, end_row)).Value = table['key']['key']
+            self.wksht.Range('J%d:J%d' % (begin_row, end_row)).Value = table['table']['row']
+            self.wksht.Range('K%d:K%d' % (begin_row, end_row)).Value = table['table']['before2']
+            self.wksht.Range('L%d:L%d' % (begin_row, end_row)).Value = table['table']['before1']
+            self.wksht.Range('M%d:M%d' % (begin_row, end_row)).Value = table['table']['after1']
+            self.wksht.Range('N%d:N%d' % (begin_row, end_row)).Value = table['table']['after2']
+            self.wksht.Range('O%d:O%d' % (begin_row, end_row)).Value = u'表%d' % count
+            self.wksht.Range('P%d:P%d' % (begin_row, end_row)).Value = table['table']['page']
+
+            if table_row == 2 and table_col == 3 and u'纯文字描述' == table['table']['content'][1][0]:
+                table['table']['content'][1][0] = ''
+                self.wksht.Cells(begin_row, 22).Value = u'纯文字描述'
+
+            begin_col = 17 if table_col > 4 else (21 - table_col)
             row_i = begin_row
             for row in table['table']['content']:
                 col_i = begin_col
@@ -690,13 +813,13 @@ class Excel():
                     self.wksht.Cells(row_i, col_i).Value = item
                     col_i += 1
                 row_i += 1
-            if count == 2:  # 表2是否在文档的20%后
+            if count == 2 and first_table['table']['row'] <= 2:  # 表1为总表 表2是否在文档的20%后
                 table_page = table['table']['page']
                 if table_page > doc_pages * 0.2:
-                    self.wksht.Cells(begin_row, begin_col+table_col).Value = u'表2在word的20%之后'
+                    self.wksht.Cells(begin_row, 22).Value = u'表2在word的20%之后，需复查'
             count += 1
-        self.wksht.Range('C%d:C%d' % (self.current_begin, self.current_end)).Value = u'是'
-        self.wksht.Range('H%d:H%d' % (self.current_begin, self.current_end)).Value = len(tables)
+        self.wksht.Range('D%d:D%d' % (self.current_begin, self.current_end)).Value = u'是'
+        self.wksht.Range('I%d:I%d' % (self.current_begin, self.current_end)).Value = len(tables)
 
 
 class WorkerThread(Thread):
@@ -724,8 +847,8 @@ class WorkerThread(Thread):
             wx.LogMessage(u'工作线程已经结束')
         except:
             etype, value, tb = sys.exc_info()
-            print traceback.print_exc()
             message = u'工作线程出现异常:\n'
+            print message, traceback.print_exc()
             message += ''.join(traceback.format_exception(etype, value, tb))
             wx.LogMessage(message)
             wx.MessageBox(u'程序出现异常', caption=u'错误信息', style=wx.ICON_ERROR)
@@ -793,7 +916,7 @@ class RunPanel(wx.Panel):
 
     def stop_click(self, event):
         self.thread.stop()
-        wx.LogMessage(u'程序已收到暂停请求，处理完当前文件会暂停工作！')
+        wx.LogMessage(u'程序已收到暂停请求，处理完当前文件会暂停工作！请稍等！！！')
 
     def excel_init_click(self, event):
         wx.LogMessage(u'初始化Excel开始，请稍等！')
@@ -824,58 +947,96 @@ class RunPanel(wx.Panel):
 class ConfigPanel(wx.Panel):
     def __init__(self, parent):
         wx.Panel.__init__(self, parent)
-        self.config = SqlData().get_config()
+        config = SqlData().get_config()
 
         self.excel_label = wx.StaticText(self, label=u'EXCEL文件')
-        self.excel_file = wx.TextCtrl(self, value=self.config['excel_file'])
+        self.excel_file = wx.TextCtrl(self, value=config['excel_file'])
         self.excel_btn = wx.Button(self, label=u'选择文件')
         self.Bind(wx.EVT_BUTTON, self.excel_click, self.excel_btn)
 
         self.pdf_label = wx.StaticText(self, label=u'PDF目录')
-        self.pdf_dir = wx.TextCtrl(self, value=self.config['pdf_dir'])
+        self.pdf_dir = wx.TextCtrl(self, value=config['pdf_dir'])
         self.pdf_btn = wx.Button(self, label=u'选择目录')
         self.Bind(wx.EVT_BUTTON, self.pdf_click, self.pdf_btn)
 
         self.word_label = wx.StaticText(self, label=u'WORD目录')
-        self.word_dir = wx.TextCtrl(self, value=self.config['word_dir'])
+        self.word_dir = wx.TextCtrl(self, value=config['word_dir'])
         self.word_btn = wx.Button(self, label=u'选择目录')
         self.Bind(wx.EVT_BUTTON, self.word_click, self.word_btn)
 
         self.sheet_label = wx.StaticText(self, label=u'当前Sheet名字')
-        self.sheet = wx.TextCtrl(self, value=self.config['sheet'])
+        self.sheet = wx.TextCtrl(self, value=config['sheet'])
 
-        self.save_btn = wx.Button(self, label=u'保存设置')
-        self.Bind(wx.EVT_BUTTON, self.save_click, self.save_btn)
+        self.save_config_btn = wx.Button(self, label=u'保存设置')
+        self.Bind(wx.EVT_BUTTON, self.save_config_click, self.save_config_btn)
 
         self.top_sizer = wx.BoxSizer(wx.VERTICAL)
         self.path_sizer = wx.GridBagSizer(hgap=10, vgap=10)
         self.path_sizer.Add(self.excel_label, pos=(0, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
-        self.path_sizer.Add(self.excel_file, pos=(0, 1), span=(1, 28), flag=wx.EXPAND)
-        self.path_sizer.Add(self.excel_btn, pos=(0, 29), span=(1, 1), flag=wx.EXPAND)
+        self.path_sizer.Add(self.excel_file, pos=(0, 1), span=(1, 29), flag=wx.EXPAND)
+        self.path_sizer.Add(self.excel_btn, pos=(0, 30), span=(1, 1), flag=wx.EXPAND)
         self.path_sizer.Add(self.pdf_label, pos=(1, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
-        self.path_sizer.Add(self.pdf_dir, pos=(1, 1), span=(1, 28), flag=wx.EXPAND)
-        self.path_sizer.Add(self.pdf_btn, pos=(1, 29), span=(1, 1), flag=wx.EXPAND)
+        self.path_sizer.Add(self.pdf_dir, pos=(1, 1), span=(1, 29), flag=wx.EXPAND)
+        self.path_sizer.Add(self.pdf_btn, pos=(1, 30), span=(1, 1), flag=wx.EXPAND)
         self.path_sizer.Add(self.word_label, pos=(2, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
-        self.path_sizer.Add(self.word_dir, pos=(2, 1), span=(1, 28), flag=wx.EXPAND)
-        self.path_sizer.Add(self.word_btn, pos=(2, 29), span=(1, 1), flag=wx.EXPAND)
+        self.path_sizer.Add(self.word_dir, pos=(2, 1), span=(1, 29), flag=wx.EXPAND)
+        self.path_sizer.Add(self.word_btn, pos=(2, 30), span=(1, 1), flag=wx.EXPAND)
         self.path_sizer.Add(self.sheet_label, pos=(3, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
-        self.path_sizer.Add(self.sheet, pos=(3, 1), span=(1, 28), flag=wx.EXPAND)
-        self.path_sizer.Add(self.save_btn, pos=(3, 29), span=(1, 1), flag=wx.EXPAND)
-        self.static_sizer = wx.StaticBoxSizer(wx.StaticBox(self, -1, label=u'路径配置'), wx.VERTICAL)
-        self.static_sizer.Add(self.path_sizer, proportion=0, flag=wx.EXPAND, border=10)
+        self.path_sizer.Add(self.sheet, pos=(3, 1), span=(1, 29), flag=wx.EXPAND)
+        self.path_sizer.Add(self.save_config_btn, pos=(3, 30), span=(1, 1), flag=wx.EXPAND)
+        self.path_static_sizer = wx.StaticBoxSizer(wx.StaticBox(self, -1, label=u'路径配置'), wx.VERTICAL)
+        self.path_static_sizer.Add(self.path_sizer, proportion=0, flag=wx.EXPAND | wx.ALL, border=5)
+        self.top_sizer.Add(self.path_static_sizer, proportion=0, flag=wx.EXPAND | wx.ALL, border=5)
 
-        self.top_sizer.Add(self.static_sizer, 0, wx.EXPAND, 20)
+        self.filter_row_label = wx.StaticText(self, label=u'表格头行过滤字')
+        self.filter_row = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(200, 60), value=config['filter_row'])
+        self.filter_col_label = wx.StaticText(self, label=u'表格头列过滤字')
+        self.filter_col = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(200, 60), value=config['filter_col'])
+        self.key_label = wx.StaticText(self, label=u'表格关键字')
+        keys = SqlData().get_keys()
+        keys_text = []
+        for key in keys:
+            keys_text.append(key['key'])
+        self.keys_value = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(200, 150), value='|'.join(keys_text))
+        self.save_keys_btn = wx.Button(self, label=u'保存关键字')
+        self.Bind(wx.EVT_BUTTON, self.save_keys_click, self.save_keys_btn)
+
+        self.key_sizer = wx.GridBagSizer(hgap=10, vgap=10)
+        self.key_sizer.Add(self.filter_row_label, pos=(0, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
+        self.key_sizer.Add(self.filter_row, pos=(0, 1), span=(1, 30), flag=wx.EXPAND)
+        self.key_sizer.Add(self.filter_col_label, pos=(1, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
+        self.key_sizer.Add(self.filter_col, pos=(1, 1), span=(1, 30), flag=wx.EXPAND)
+        self.key_sizer.Add(self.key_label, pos=(2, 0), span=(1, 1), flag=wx.ALIGN_RIGHT | wx.ALIGN_CENTRE_VERTICAL)
+        self.key_sizer.Add(self.keys_value, pos=(2, 1), span=(1, 29), flag=wx.EXPAND)
+        self.key_sizer.Add(self.save_keys_btn, pos=(2, 30), span=(1, 1))
+        self.key_static_sizer = wx.StaticBoxSizer(wx.StaticBox(self, -1, label=u'关键字配置'), wx.VERTICAL)
+        self.key_static_sizer.Add(self.key_sizer, proportion=0, flag=wx.EXPAND | wx.ALL, border=5)
+        self.top_sizer.Add(self.key_static_sizer, proportion=0, flag=wx.EXPAND | wx.ALL, border=5)
+
         self.SetSizerAndFit(self.top_sizer)
 
-    def save_click(self, event):
-        self.config['excel_file'] = self.excel_file.GetValue()
-        self.config['pdf_dir'] = self.pdf_dir.GetValue()
-        self.config['word_dir'] = self.word_dir.GetValue()
-        self.config['sheet'] = self.sheet.GetValue()
-        if SqlData().save_config(self.config):
+    def save_config_click(self, event):
+        config = {
+            'excel_file': self.excel_file.GetValue().strip(),
+            'pdf_dir': self.pdf_dir.GetValue().strip(),
+            'word_dir': self.word_dir.GetValue().strip(),
+            'sheet': self.sheet.GetValue().strip()
+        }
+        if SqlData().save_config(config):
             wx.MessageDialog(self, u'保持配置成功', u'消息', wx.OK_DEFAULT).ShowModal()
         else:
             wx.MessageDialog(self, u'保持配置失败', u'消息', wx.OK_DEFAULT).ShowModal()
+
+    def save_keys_click(self, event):
+        config = {
+            'filter_row': self.filter_row.GetValue().strip(),
+            'filter_col': self.filter_col.GetValue().strip(),
+            'keys': self.keys_value.GetValue().strip()
+        }
+        if SqlData().save_keys(config):
+            wx.MessageDialog(self, u'保持关键字成功', u'消息', wx.OK_DEFAULT).ShowModal()
+        else:
+            wx.MessageDialog(self, u'保持关键字失败', u'消息', wx.OK_DEFAULT).ShowModal()
 
     def excel_click(self, event):
         file_dialog = wx.FileDialog(self, u'选择Excel文件', '', '',
@@ -912,6 +1073,10 @@ class MainWindow(wx.Frame):
                           style = wx.DEFAULT_FRAME_STYLE & ~wx.MAXIMIZE_BOX)
         self.Center()
         sys.excepthook = except_hook
+        if sys.platform == 'win32':
+            exe_name = sys.executable
+            icon = wx.Icon(exe_name, wx.BITMAP_TYPE_ICO)
+            self.SetIcon(icon)
 
 
 if __name__ == '__main__':
